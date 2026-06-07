@@ -1,4 +1,4 @@
-import { relations } from "drizzle-orm";
+import { relations, sql } from "drizzle-orm";
 import {
   boolean,
   foreignKey,
@@ -44,6 +44,9 @@ export const transcriptSource = pgEnum("transcript_source", [
   "whisper",
 ]);
 
+// #4: role as a DB-level enum instead of text + $type.
+export const chatRole = pgEnum("chat_role", ["user", "assistant"]);
+
 export const videos = pgTable(
   "videos",
   {
@@ -51,7 +54,8 @@ export const videos = pgTable(
     youtubeId: text("youtube_id").notNull(),
     title: text("title"),
     channel: text("channel"),
-    durationSec: integer("duration_sec").notNull(),
+    // #6: duration may not be known at insert time; make it nullable.
+    durationSec: integer("duration_sec"),
     thumbnailUrl: text("thumbnail_url"),
     hasCaptions: boolean("has_captions").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
@@ -59,11 +63,35 @@ export const videos = pgTable(
   (t) => [uniqueIndex("videos_youtube_id_idx").on(t.youtubeId)],
 );
 
+export const folders = pgTable(
+  "folders",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    // #1: real FK to users.id (uuid), was loosely typed text with no FK.
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    parentId: uuid("parent_id"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    index("folders_user_idx").on(t.userId),
+    // Self-reference: deleting a folder deletes its subtree (affected jobs fall back
+    // to the library root via jobs.folderId ON DELETE SET NULL).
+    // #3: cycles (A.parent=B, B.parent=A) are NOT prevented here — guard in app code.
+    foreignKey({ columns: [t.parentId], foreignColumns: [t.id], name: "folders_parent_fk" }).onDelete("cascade"),
+  ],
+);
+
 export const jobs = pgTable(
   "jobs",
   {
     id: uuid("id").defaultRandom().primaryKey(),
-    userId: text("user_id").notNull(),
+    // #1: real FK to users.id.
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
     videoId: uuid("video_id")
       .notNull()
       .references(() => videos.id, { onDelete: "cascade" }),
@@ -95,38 +123,30 @@ export const jobs = pgTable(
   },
   (t) => [
     index("jobs_user_idx").on(t.userId, t.createdAt),
-    index("jobs_status_idx").on(t.status),
-    index("jobs_library_idx").on(t.userId, t.folderId),
+    // #5: status alone is low-cardinality; pair with createdAt for worker polling.
+    index("jobs_status_idx").on(t.status, t.createdAt),
+    // #5: include libraryOrder so ordered library reads are index-sorted,
+    // and make it partial on in_library since most jobs aren't in the library.
+    index("jobs_library_idx").on(t.userId, t.folderId, t.libraryOrder).where(sql`${t.inLibrary}`),
   ],
 );
 
-export const folders = pgTable(
-  "folders",
+export const transcripts = pgTable(
+  "transcripts",
   {
     id: uuid("id").defaultRandom().primaryKey(),
-    userId: text("user_id").notNull(),
-    name: text("name").notNull(),
-    parentId: uuid("parent_id"),
+    videoId: uuid("video_id")
+      .notNull()
+      .references(() => videos.id, { onDelete: "cascade" }),
+    source: transcriptSource("source").notNull(),
+    text: text("text").notNull(),
+    segments: jsonb("segments").$type<TranscriptSegment[]>().notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
-  (t) => [
-    index("folders_user_idx").on(t.userId),
-    // Self-reference: deleting a folder deletes its subtree (affected jobs fall back
-    // to the library root via jobs.folderId ON DELETE SET NULL).
-    foreignKey({ columns: [t.parentId], foreignColumns: [t.id], name: "folders_parent_fk" }).onDelete("cascade"),
-  ],
+  // #2: multiple transcripts per video are by design (shared artifact: caption->whisper
+  // fallback, retries, re-processing). Append-only; reads take newest by created_at.
+  (t) => [index("transcripts_video_idx").on(t.videoId, t.createdAt)],
 );
-
-export const transcripts = pgTable("transcripts", {
-  id: uuid("id").defaultRandom().primaryKey(),
-  videoId: uuid("video_id")
-    .notNull()
-    .references(() => videos.id, { onDelete: "cascade" }),
-  source: transcriptSource("source").notNull(),
-  text: text("text").notNull(),
-  segments: jsonb("segments").$type<TranscriptSegment[]>().notNull(),
-  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
-});
 
 export const summaries = pgTable(
   "summaries",
@@ -141,7 +161,9 @@ export const summaries = pgTable(
     topic: text("topic"),
     summary: text("summary").notNull(),
   },
-  (t) => [index("summaries_job_idx").on(t.jobId, t.minuteIndex)],
+  // #2: unique on (jobId, minuteIndex) prevents duplicate rows on retry and
+  // replaces the plain index (it also serves the (jobId, minuteIndex) read path).
+  (t) => [uniqueIndex("summaries_job_minute_idx").on(t.jobId, t.minuteIndex)],
 );
 
 export const topics = pgTable(
@@ -167,12 +189,18 @@ export const chatMessages = pgTable(
     jobId: uuid("job_id")
       .notNull()
       .references(() => jobs.id, { onDelete: "cascade" }),
-    role: text("role").$type<"user" | "assistant">().notNull(),
+    // #4: enum instead of text + $type.
+    role: chatRole("role").notNull(),
     content: text("content").notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (t) => [index("chat_messages_job_idx").on(t.jobId, t.createdAt)]
 );
+
+export const usersRelations = relations(users, ({ many }) => ({
+  jobs: many(jobs),
+  folders: many(folders),
+}));
 
 export const videosRelations = relations(videos, ({ many }) => ({
   jobs: many(jobs),
@@ -180,7 +208,12 @@ export const videosRelations = relations(videos, ({ many }) => ({
   topics: many(topics),
 }));
 
+export const transcriptsRelations = relations(transcripts, ({ one }) => ({
+  video: one(videos, { fields: [transcripts.videoId], references: [videos.id] }),
+}));
+
 export const jobsRelations = relations(jobs, ({ one, many }) => ({
+  user: one(users, { fields: [jobs.userId], references: [users.id] }),
   video: one(videos, { fields: [jobs.videoId], references: [videos.id] }),
   folder: one(folders, { fields: [jobs.folderId], references: [folders.id] }),
   summaries: many(summaries),
@@ -188,6 +221,7 @@ export const jobsRelations = relations(jobs, ({ one, many }) => ({
 }));
 
 export const foldersRelations = relations(folders, ({ one, many }) => ({
+  user: one(users, { fields: [folders.userId], references: [users.id] }),
   parent: one(folders, { fields: [folders.parentId], references: [folders.id], relationName: "folder_parent" }),
   children: many(folders, { relationName: "folder_parent" }),
   jobs: many(jobs),

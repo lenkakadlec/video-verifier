@@ -1,10 +1,10 @@
 # Video Verifier
 
-Paste a YouTube URL, get per-minute summaries, key points, and a chat panel you can ask questions in. Built end to end by one developer: data model, background workers, the Claude integration, cost accounting, auth, and UI. · [live demo](#)
+Paste a YouTube URL, get per-minute summaries, key points, and a chat panel you can ask questions in. Built end to end by one developer: data model, background workers, the Claude integration, cost accounting, auth, and UI. · [demo](https://www.youtube.com/watch?v=3BUYIdfCF-4)
 
 ---
 
-![Video Verifier library and chat panel](assets/library-chat.png)
+![Video Verifier library and chat panel](assets/summary.png)
 
 ---
 
@@ -32,7 +32,7 @@ Cost is tracked per job in the database and shown in the UI before you process a
 | ------ | ------------- | ---------------- |
 | 10 min | ~$0.006       | ~$0.013          |
 | 60 min | ~$0.032       | ~$0.072          |
-| 3 hr   | n/a           | ~$0.215          |
+| 3 hr   | ~$0.100       | ~$0.215          |
 
 Processing is cheap. The expensive part is claim verification. A 16-minute captioned video costs about $0.13 end to end: roughly $0.01 to process and $0.12 to verify claims against web sources. That number climbs with video length and how many claims are packed in.
 
